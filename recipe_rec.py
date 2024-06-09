@@ -12,6 +12,7 @@ the more cravings or words similar to the person's cravings, the higher the reci
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.neighbors import NearestNeighbors
 from collections import Counter
@@ -31,10 +32,11 @@ from nltk.tokenize import word_tokenize
 nltk.download('stopwords')
 nltk.download('wordnet')
 nltk.download('omw-1.4')
+nltk.download('punkt')
 
 # data formatting
 
-dataframe = pd.read_json('recipes_raw_nosource_fn.json')
+dataframe = pd.read_json('recipe_data.json')
 dataframe = dataframe.transpose()
 dataframe = dataframe.reset_index()
 dataframe.drop(columns=dataframe.columns[0], axis=1,  inplace=True)
@@ -60,8 +62,10 @@ def ingredient_parser(ingredients):
             stop_words = set(stopwords.words('english'))
             items = [word for word in items if word not in stop_words] # remove stop words
             items = [word for word in items if word not in measures] # remove measurement words
+            # if items:
+            #     ingred_list.append(' '.join(items))
             if items:
-                ingred_list.append(' '.join(items))
+                ingred_list.extend(items)
         
     return ingred_list
 
@@ -74,8 +78,69 @@ for lst in df['ingredients']:
 df['cleaned_ingredients'] = cleaned_ingred_list
 
 # use Word2Vec (CBOW) to map out relationships between words --> make your own neural network
+# model = Word2Vec(sentences=cleaned_ingred_list, vector_size=100, window=5, min_count=1, workers=4)
 
-model = Word2Vec(sentences=cleaned_ingred_list, vector_size=100, window=5, min_count=1, workers=4)
+# Create the corpus
+corpus = [' '.join(ingredients) for ingredients in cleaned_ingred_list]
+
+def generate_cbows(corpus, window_size):
+    cbows = []
+    for sentence in corpus:
+        words = word_tokenize(sentence.lower())
+        for i, target_word in enumerate(words):
+            context_words = words[max(0, i - window_size):i] + words[i + 1:i + window_size + 1]
+            if len(context_words) == window_size * 2:
+                cbows.append((context_words, target_word))
+    return cbows
+
+window_size = 2
+cbows = generate_cbows(corpus, window_size)
+
+class CBOWModel(nn.Module):
+    def __init__(self, vocab_size, embed_size):
+        super(CBOWModel, self).__init__()
+        self.embeddings = nn.Embedding(vocab_size, embed_size)
+        self.linear1 = nn.Linear(embed_size, vocab_size)
+        
+    def forward(self, inputs):
+        embeds = sum(self.embeddings(inputs)).view(1, -1)
+        out = self.linear1(embeds)
+        return out
+
+# Prepare the data for PyTorch
+unique_words = list(set([word for sentence in cleaned_ingred_list for word in sentence]))
+word_to_ix = {word: i for i, word in enumerate(unique_words)}
+ix_to_word = {i: word for word, i in word_to_ix.items()}
+
+def prepare_sequence(seq, to_ix):
+    idxs = [to_ix[w] for w in seq if w in to_ix]  # Only retrieve index if word exists in the vocabulary
+    return torch.tensor(idxs, dtype=torch.long)
+
+# Create the model
+VOCAB_SIZE = len(unique_words)
+EMBED_SIZE = 10  # You can adjust this size
+model = CBOWModel(VOCAB_SIZE, EMBED_SIZE)
+
+# Loss and optimizer
+loss_function = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=0.01)
+
+# Training the model
+epochs = 10
+for epoch in range(epochs):
+    total_loss = 0
+    for context, target in cbows:
+        if target in word_to_ix:
+            context_idxs = prepare_sequence(context, word_to_ix)
+            target_idx = torch.tensor([word_to_ix[target]], dtype=torch.long)
+        model.zero_grad()
+        log_probs = model(context_idxs)
+        loss = loss_function(log_probs, target_idx)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+    print(f"Epoch {epoch + 1}, Loss: {total_loss}")
 
 # calculate average of vector representations to get a singular value for each recipe
 def calculate_average_vector(cleaned_ingred_list, model):
@@ -105,7 +170,8 @@ def calculate_cosine_similarity(v1, v2):
 # rank recipes
 def rank_recipes(allergies, cravings, cleaned_ingred_list, model, df):
     ranked_recipes = []
-    reference_vector = np.zeros(model.vector_size)
+    # reference_vector = np.zeros(model.vector_size)
+    reference_vector = np.zeros(EMBED_SIZE)
 
     # Adjust reference vector based on user's cravings
     for word in cravings:
@@ -131,3 +197,9 @@ def rank_recipes(allergies, cravings, cleaned_ingred_list, model, df):
     
     # Return ranked recipes
     return ranked_recipes
+
+user_allergies = ['peanuts', 'shellfish']
+user_cravings = ['chocolate', 'cake']
+ranked_recipes = rank_recipes(user_allergies, user_cravings, cleaned_ingred_list, model, df)
+top_ten_recipes = ranked_recipes[:10]
+print(top_ten_recipes)
